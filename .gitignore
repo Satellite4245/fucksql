@@ -1,3 +1,4 @@
 pyproject.toml
 *.db
 __pycache__
+*.lock

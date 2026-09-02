@@ -552,3 +552,15 @@ class FUCKsqlite:
         sql_cmd = f'DROP INDEX {if_exists_cmd}"{esc_idx}"'
         await self.conn.execute(sql_cmd)
         await self._auto_commit_if_needed()
+
+    async def table_exists(self, table_name: str) -> bool:
+        if not isinstance(table_name, str):
+            raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
+        if not table_name.isidentifier():
+            raise ValueError(f"Invalid table name: {table_name}")
+
+        return await self.exists(
+            table_name = "sqlite_master",
+            where = "type='table' AND name = ?",
+            params = table_name,
+        )
