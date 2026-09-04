@@ -1,11 +1,23 @@
-from typing import *
+from __future__ import annotations
+
+from typing import Any, Literal, Sequence, cast
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 import aiosqlite
 
-ALLOWED_TYPES = {"INTEGER", "TEXT", "REAL", "BLOB", "NULL"}
+ALLOWED_TYPES = frozenset({"INTEGER", "TEXT", "REAL", "BLOB", "NULL"})
+SQL_DEFAULT_KEYWORDS = frozenset({
+    "CURRENT_TIME",
+    "CURRENT_DATE",
+    "CURRENT_TIMESTAMP",
+    "NULL",
+    "TRUE",
+    "FALSE",
+})
+
 ON_ACTION = Literal["CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT", "NO ACTION"]
 ORDER_DIR = Literal["ASC", "DESC"]
+OR_ACTION = Literal["IGNORE", "REPLACE", "ABORT", "FAIL", "ROLLBACK"]
 
 
 def _escape_identifier(name: str) -> str:
@@ -16,8 +28,8 @@ def _escape_identifier(name: str) -> str:
 class ForeignKey:
     target_table: str
     target_column: str
-    on_delete: Optional[ON_ACTION] = None
-    on_update: Optional[ON_ACTION] = None
+    on_delete: ON_ACTION | None = None
+    on_update: ON_ACTION | None = None
 
     def to_sql(self) -> str:
         esc_tbl = _escape_identifier(self.target_table)
@@ -38,8 +50,7 @@ def _format_default_value(val: Any) -> str:
     if isinstance(val, (int, float)):
         return str(val)
     if isinstance(val, str):
-        sql_keywords = {"CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP", "NULL", "TRUE", "FALSE"}
-        if val.upper() in sql_keywords:
+        if val.upper() in SQL_DEFAULT_KEYWORDS:
             return val.upper()
         escaped = val.replace("'", "''")
         return f"'{escaped}'"
@@ -56,9 +67,9 @@ class Column:
     autoincrement: bool = False
     not_null: bool = False
     unique: bool = False
-    default: Optional[Any] = None
-    check: Optional[str] = None
-    foreign_key: Optional[ForeignKey] = None
+    default: Any = None
+    check: str | None = None
+    foreign_key: ForeignKey | None = None
 
     def __post_init__(self):
         if not isinstance(self.name, str):
@@ -78,7 +89,7 @@ class Column:
 
     def to_sql(self) -> str:
         esc_name = _escape_identifier(self.name)
-        sql_cmd = [f'\"{esc_name}\"', self.data_type]
+        sql_cmd = [f'"{esc_name}"', self.data_type]
         if self.primary_key:
             sql_cmd.append("PRIMARY KEY")
             if self.autoincrement:
@@ -110,8 +121,14 @@ class FUCKsqlite:
         self.use_foreign_key = use_foreign_key
         self.busy_timeout_ms = busy_timeout_ms
         self.autocommit = autocommit
-        self.conn: Optional[aiosqlite.Connection] = None
+        self.conn: aiosqlite.Connection | None = None
         self._in_transaction = False
+
+    def _get_connection(self) -> aiosqlite.Connection:
+        """연결 상태를 검증하고 aiosqlite.Connection 인스턴스를 반환합니다."""
+        if self.conn is None:
+            raise RuntimeError(f"Database is not connected. Database Name: {self.db_name}")
+        return self.conn
 
     async def connect(self) -> None:
         self.conn = await aiosqlite.connect(self.db_name)
@@ -123,17 +140,15 @@ class FUCKsqlite:
         await self.conn.commit()
 
     async def commit(self) -> None:
-        await self.__is_it_connected()
-        assert self.conn is not None
-        await self.conn.commit()
+        conn = self._get_connection()
+        await conn.commit()
 
     async def rollback(self) -> None:
-        await self.__is_it_connected()
-        assert self.conn is not None
-        await self.conn.rollback()
+        conn = self._get_connection()
+        await conn.rollback()
 
     async def close(self) -> None:
-        if self.conn:
+        if self.conn is not None:
             if not self._in_transaction:
                 try:
                     await self.conn.commit()
@@ -141,62 +156,60 @@ class FUCKsqlite:
                     pass
             await self.conn.close()
             self.conn = None
+            self._in_transaction = False
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> FUCKsqlite:
         await self.connect()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         await self.close()
 
-    async def __is_it_connected(self) -> None:
-        if not self.conn:
-            raise RuntimeError(f"Database is not connected. Database Name: {self.db_name}")
-
     @asynccontextmanager
     async def transaction(self):
         """에러 발생 시 ROLLBACK, 정상 완료 시 COMMIT을 보장하는 트랜잭션 컨텍스트 매니저."""
-        await self.__is_it_connected()
-        assert self.conn is not None
+        conn = self._get_connection()
         prev_in_tx = self._in_transaction
         self._in_transaction = True
         try:
             yield self
-            await self.conn.commit()
+            await conn.commit()
         except Exception:
-            await self.conn.rollback()
+            await conn.rollback()
             raise
         finally:
             self._in_transaction = prev_in_tx
 
     async def _auto_commit_if_needed(self) -> None:
         if self.autocommit and not self._in_transaction:
-            assert self.conn is not None
-            await self.conn.commit()
+            conn = self._get_connection()
+            await conn.commit()
 
-    def _normalize_params(self, params: Optional[Union[Sequence[Any], Any]]) -> list[Any]:
-        """params가 None, 단일 원소(int, str 등), 또는 Sequence(list, tuple)일 때 모두 list로 정규화합니다."""
+    def _normalize_params(self, params: Sequence[Any] | Any | None) -> Sequence[Any]:
+        """params가 None, 단일 원소(int, str 등), 또는 Sequence(list, tuple)일 때 바인딩 가능한 Sequence로 정규화합니다."""
         if params is None:
-            return []
-        if isinstance(params, (list, tuple, set)):
+            return ()
+        if isinstance(params, (list, tuple)):
+            return params
+        if isinstance(params, set):
             return list(params)
-        return [params]
+        return (params,)
 
     def _build_where_clause(
             self,
-            where: Optional[str],
-            params: Optional[Union[Sequence[Any], Any]] = None,
-    ) -> tuple[str, list[Any]]:
-        """where Raw SQL 문자열과 파라미터를 파싱하여 WHERE SQL 절과 바인딩할 파라미터 리스트를 반환합니다."""
+            where: str | None,
+            params: Sequence[Any] | Any | None = None,
+    ) -> tuple[str, Sequence[Any]]:
+        """where Raw SQL 문자열과 파라미터를 파싱하여 WHERE SQL 절과 바인딩할 파라미터 시퀀스를 반환합니다."""
         if not where:
-            return "", []
+            return "", ()
 
         if not isinstance(where, str):
             raise TypeError(f"where must be a raw SQL string, got {type(where).__name__}")
 
         where_str = where.strip()
         if not where_str:
-            return "", []
+            return "", ()
 
         clause = where_str if where_str.upper().startswith("WHERE ") else f"WHERE {where_str}"
         val_list = self._normalize_params(params)
@@ -216,15 +229,14 @@ class FUCKsqlite:
             raise TypeError("At least one column must be provided.")
         if not all(isinstance(column, Column) for column in columns):
             raise TypeError("All items in columns must be of type Column.")
-        await self.__is_it_connected()
-        assert self.conn is not None
 
+        conn = self._get_connection()
         if_not_exists_cmd = "IF NOT EXISTS " if if_not_exists else ""
         cols_def = ", ".join(col.to_sql() for col in columns)
 
         esc_tbl = _escape_identifier(table_name)
         sql_cmd = f'CREATE TABLE {if_not_exists_cmd}"{esc_tbl}" ({cols_def})'
-        await self.conn.execute(sql_cmd)
+        await conn.execute(sql_cmd)
         await self._auto_commit_if_needed()
 
     async def drop_table(self, table_name: str, if_exists: bool = True) -> None:
@@ -233,31 +245,28 @@ class FUCKsqlite:
         if not table_name.isidentifier():
             raise ValueError(f"Invalid table name: {table_name}")
 
-        await self.__is_it_connected()
-        assert self.conn is not None
-
+        conn = self._get_connection()
         if_exists_cmd = "IF EXISTS " if if_exists else ""
         esc_tbl = _escape_identifier(table_name)
         sql_cmd = f'DROP TABLE {if_exists_cmd}"{esc_tbl}"'
 
-        await self.conn.execute(sql_cmd)
+        await conn.execute(sql_cmd)
         await self._auto_commit_if_needed()
 
     async def insert(
             self,
             table_name: str,
             data: dict[str, Any],
-            or_action: Optional[Literal["IGNORE", "REPLACE", "ABORT", "FAIL", "ROLLBACK"]] = None,
-    ) -> int:
+            or_action: OR_ACTION | None = None,
+    ) -> int | None:
         if not isinstance(table_name, str):
             raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
         if not table_name.isidentifier():
             raise ValueError(f"Invalid table name: {table_name}")
         if not data:
             raise ValueError("Data dictionary cannot be empty.")
-        await self.__is_it_connected()
-        assert self.conn is not None
 
+        conn = self._get_connection()
         columns = list(data.keys())
         values = list(data.values())
 
@@ -268,7 +277,7 @@ class FUCKsqlite:
         esc_tbl = _escape_identifier(table_name)
         sql_cmd = f'INSERT {or_cmd}INTO "{esc_tbl}" ({cols_str}) VALUES ({placeholders})'
 
-        cur = await self.conn.execute(sql_cmd, values)
+        cur = await conn.execute(sql_cmd, values)
         await self._auto_commit_if_needed()
         return cur.lastrowid
 
@@ -282,38 +291,32 @@ class FUCKsqlite:
         if not data_list:
             return 0
 
-        await self.__is_it_connected()
-        assert self.conn is not None
+        conn = self._get_connection()
 
-        columns: list[str] = []
-        for row in data_list:
-            for k in row.keys():
-                if k not in columns:
-                    columns.append(k)
-
+        # O(N) 순서 보존 컬럼 추출
+        columns = list(dict.fromkeys(k for row in data_list for k in row))
         cols_str = ", ".join(f'"{_escape_identifier(col)}"' for col in columns)
         placeholders = ", ".join("?" for _ in columns)
 
-        values = [tuple(row.get(col, None) for col in columns) for row in data_list]
+        values = [tuple(row.get(col) for col in columns) for row in data_list]
 
         esc_tbl = _escape_identifier(table_name)
         sql_cmd = f'INSERT INTO "{esc_tbl}" ({cols_str}) VALUES ({placeholders})'
-        cur = await self.conn.executemany(sql_cmd, values)
+        cur = await conn.executemany(sql_cmd, values)
         await self._auto_commit_if_needed()
         return cur.rowcount
 
     async def select(
             self,
             table_name: str,
-            columns: Optional[list[str]] = None,
-            where: Optional[str] = None,
-            params: Optional[Union[Sequence[Any], Any]] = None,
-            order_by: Optional[Union[str, tuple[str, ORDER_DIR], list[tuple[str, ORDER_DIR]]]] = None,
-            limit: Optional[int] = None,
-            offset: Optional[int] = None,
+            columns: list[str] | None = None,
+            where: str | None = None,
+            params: Sequence[Any] | Any | None = None,
+            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | None = None,
+            limit: int | None = None,
+            offset: int | None = None,
     ) -> list[dict[str, Any]]:
-        await self.__is_it_connected()
-        assert self.conn is not None
+        conn = self._get_connection()
 
         esc_tbl = _escape_identifier(table_name)
         cols = ", ".join(f'"{_escape_identifier(col)}"' for col in columns) if columns else "*"
@@ -359,18 +362,18 @@ class FUCKsqlite:
 
         full_sql = " ".join(sql_cmd)
 
-        async with self.conn.execute(full_sql, values) as cur:
+        async with conn.execute(full_sql, values) as cur:
             rows = await cur.fetchall()
             return cast(list[dict[str, Any]], [dict(row) for row in rows])
 
     async def select_one(
             self,
             table_name: str,
-            columns: Optional[list[str]] = None,
-            where: Optional[str] = None,
-            params: Optional[Union[Sequence[Any], Any]] = None,
-            order_by: Optional[Union[str, tuple[str, ORDER_DIR], list[tuple[str, ORDER_DIR]]]] = None,
-    ) -> Optional[dict[str, Any]]:
+            columns: list[str] | None = None,
+            where: str | None = None,
+            params: Sequence[Any] | Any | None = None,
+            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | None = None,
+    ) -> dict[str, Any] | None:
         results = await self.select(
             table_name=table_name,
             columns=columns,
@@ -385,9 +388,9 @@ class FUCKsqlite:
             self,
             table_name: str,
             data: dict[str, Any],
-            where: Optional[str] = None,
-            params: Optional[Union[Sequence[Any], Any]] = None,
-            or_action: Optional[Literal["IGNORE", "REPLACE", "ABORT", "FAIL", "ROLLBACK"]] = None,
+            where: str | None = None,
+            params: Sequence[Any] | Any | None = None,
+            or_action: OR_ACTION | None = None,
             allow_all: bool = False,
     ) -> int:
         if not isinstance(table_name, str):
@@ -399,8 +402,7 @@ class FUCKsqlite:
         if not where and not allow_all:
             raise ValueError("Where is required to update the table. Or enable allow_all=True.")
 
-        await self.__is_it_connected()
-        assert self.conn is not None
+        conn = self._get_connection()
 
         cols = []
         values = []
@@ -419,11 +421,17 @@ class FUCKsqlite:
             values.extend(where_values)
 
         full_sql = " ".join(sql_cmd)
-        cur = await self.conn.execute(full_sql, values)
+        cur = await conn.execute(full_sql, values)
         await self._auto_commit_if_needed()
         return cur.rowcount
 
-    async def delete(self, table_name:str, where: Optional[str] = None, params: Optional[Union[Sequence[Any], Any]] = None, allow_all: bool = False) -> int:
+    async def delete(
+            self,
+            table_name: str,
+            where: str | None = None,
+            params: Sequence[Any] | Any | None = None,
+            allow_all: bool = False,
+    ) -> int:
         if not isinstance(table_name, str):
             raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
         if not table_name.isidentifier():
@@ -431,8 +439,7 @@ class FUCKsqlite:
         if not where and not allow_all:
             raise ValueError("Where is required to delete the table. Or enable allow_all=True.")
 
-        await self.__is_it_connected()
-        assert self.conn is not None
+        conn = self._get_connection()
 
         sql_cmd = [f'DELETE FROM "{_escape_identifier(table_name)}"']
 
@@ -440,89 +447,122 @@ class FUCKsqlite:
         if where_clause:
             sql_cmd.append(where_clause)
 
-        sql_cmd = " ".join(sql_cmd)
+        full_sql = " ".join(sql_cmd)
 
-        cur = await self.conn.execute(sql_cmd, where_values)
+        cur = await conn.execute(full_sql, where_values)
         await self._auto_commit_if_needed()
         return cur.rowcount
 
-    async def execute(self, sql_cmd: str, params: Optional[Union[Sequence[Any], Any]] = None) -> aiosqlite.Cursor:
-        await self.__is_it_connected()
+    async def execute(
+            self,
+            sql_cmd: str,
+            params: Sequence[Any] | Any | None = None,
+    ) -> aiosqlite.Cursor:
         if not isinstance(sql_cmd, str):
             raise TypeError(f"sql_cmd must be a string, got {type(sql_cmd).__name__}")
 
-        assert self.conn is not None
-
+        conn = self._get_connection()
         val_list = self._normalize_params(params)
-        cur = await self.conn.execute(sql_cmd, val_list)
+        cur = await conn.execute(sql_cmd, val_list)
         await self._auto_commit_if_needed()
         return cur
 
-    async def fetch(self, sql_cmd: str, params: Optional[Union[Sequence[Any], Any]] = None) -> list[dict[str, Any]]:
+    async def fetch(
+            self,
+            sql_cmd: str,
+            params: Sequence[Any] | Any | None = None,
+    ) -> list[dict[str, Any]]:
         if not isinstance(sql_cmd, str):
             raise TypeError(f"sql_cmd must be a string, got {type(sql_cmd).__name__}")
-        await self.__is_it_connected()
 
-        assert self.conn is not None
+        conn = self._get_connection()
         val_list = self._normalize_params(params)
-        cur = await self.conn.execute(sql_cmd, val_list)
+        async with conn.execute(sql_cmd, val_list) as cur:
+            rows = await cur.fetchall()
+            return cast(list[dict[str, Any]], [dict(row) for row in rows])
 
-        rows = await cur.fetchall()
-        return cast(list[dict[str, Any]], [dict(row) for row in rows])
-
-    async def fetch_one(self, sql_cmd: str, params: Optional[Union[Sequence[Any], Any]] = None) -> Optional[dict[str, Any]]:
+    async def fetch_one(
+            self,
+            sql_cmd: str,
+            params: Sequence[Any] | Any | None = None,
+    ) -> dict[str, Any] | None:
         result = await self.fetch(sql_cmd, params)
         return result[0] if result else None
 
-    async def count(self, table_name: str, columns: Optional[str] = None, distinct: bool = False, where: Optional[str] = None, params: Optional[Union[Sequence[Any], Any]] = None) -> int:
+    async def count(
+            self,
+            table_name: str,
+            columns: str | None = None,
+            distinct: bool = False,
+            where: str | None = None,
+            params: Sequence[Any] | Any | None = None,
+    ) -> int:
         if not isinstance(table_name, str):
             raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
         if not table_name.isidentifier():
             raise ValueError(f"Invalid table name: {table_name}")
         if not columns and distinct:
             raise ValueError("DISTINCT aggregate must have exactly one argument")
-        await self.__is_it_connected()
+        if columns is not None and not isinstance(columns, str):
+            raise TypeError(f"columns must be a string or None, got {type(columns).__name__}")
 
-        sql_cmd = ['SELECT', 'COUNT(*)' if not columns else f'COUNT({'DISTINCT ' if distinct else ''}"{columns}")', f'AS cnt FROM "{_escape_identifier(table_name)}"']
+        conn = self._get_connection()
+
+        if columns:
+            col_target = f'COUNT({"DISTINCT " if distinct else ""}"{_escape_identifier(columns)}")'
+        else:
+            col_target = "COUNT(*)"
+
+        sql_cmd = [f'SELECT {col_target} AS cnt FROM "{_escape_identifier(table_name)}"']
 
         where_clause, where_values = self._build_where_clause(where, params)
         if where_clause:
             sql_cmd.append(where_clause)
 
-        sql_cmd = " ".join(sql_cmd)
+        full_sql = " ".join(sql_cmd)
 
-        async with self.conn.execute(sql_cmd, where_values) as cur:
+        async with conn.execute(full_sql, where_values) as cur:
             row = await cur.fetchone()
             return row["cnt"] if row else 0
 
-    async def exists(self, table_name: str, where: Optional[str] = None, params: Optional[Union[Sequence[Any], Any]] = None) -> bool:
+    async def exists(
+            self,
+            table_name: str,
+            where: str | None = None,
+            params: Sequence[Any] | Any | None = None,
+    ) -> bool:
         if not isinstance(table_name, str):
             raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
         if not table_name.isidentifier():
             raise ValueError(f"Invalid table name: {table_name}")
 
-        await self.__is_it_connected()
-        assert self.conn is not None
+        conn = self._get_connection()
 
         sql_cmd = [f'SELECT 1 FROM "{_escape_identifier(table_name)}"']
         where_clause, where_values = self._build_where_clause(where, params)
         if where_clause:
             sql_cmd.append(where_clause)
-        sql_cmd.append('LIMIT 1')
+        sql_cmd.append("LIMIT 1")
 
-        sql_cmd = " ".join(sql_cmd)
-        async with self.conn.execute(sql_cmd, where_values) as cur:
+        full_sql = " ".join(sql_cmd)
+        async with conn.execute(full_sql, where_values) as cur:
             row = await cur.fetchone()
             return row is not None
 
-    async def create_index(self, index_name: str, table_name: str, columns: Union[str, list[str]], unique: bool = False, if_not_exists: bool = True) -> None:
-        if not isinstance(index_name, str):
-            raise ValueError(f"Invaild index name: {index_name}")
-        if not isinstance(table_name, str):
-            raise ValueError(f"Invaild table name: {table_name}")
+    async def create_index(
+            self,
+            index_name: str,
+            table_name: str,
+            columns: str | list[str],
+            unique: bool = False,
+            if_not_exists: bool = True,
+    ) -> None:
+        if not isinstance(index_name, str) or not index_name.isidentifier():
+            raise ValueError(f"Invalid index name: {index_name}")
+        if not isinstance(table_name, str) or not table_name.isidentifier():
+            raise ValueError(f"Invalid table name: {table_name}")
 
-        await self.__is_it_connected()
-        assert self.conn is not None
+        conn = self._get_connection()
 
         col_list = [columns] if isinstance(columns, str) else list(columns)
         if not col_list:
@@ -536,21 +576,20 @@ class FUCKsqlite:
         cols_str = ", ".join(f'"{_escape_identifier(c)}"' for c in col_list)
 
         sql_cmd = f'CREATE {unique_cmd}INDEX {if_not_exists_cmd}"{esc_idx}" ON "{esc_tbl}" ({cols_str})'
-        await self.conn.execute(sql_cmd)
+        await conn.execute(sql_cmd)
         await self._auto_commit_if_needed()
 
     async def drop_index(self, index_name: str, if_exists: bool = True) -> None:
-        if not isinstance(index_name, str):
-            raise ValueError(f"Invaild index name: {index_name}")
+        if not isinstance(index_name, str) or not index_name.isidentifier():
+            raise ValueError(f"Invalid index name: {index_name}")
 
-        await self.__is_it_connected()
-        assert self.conn is not None
+        conn = self._get_connection()
 
         if_exists_cmd = "IF EXISTS " if if_exists else ""
         esc_idx = _escape_identifier(index_name)
 
         sql_cmd = f'DROP INDEX {if_exists_cmd}"{esc_idx}"'
-        await self.conn.execute(sql_cmd)
+        await conn.execute(sql_cmd)
         await self._auto_commit_if_needed()
 
     async def table_exists(self, table_name: str) -> bool:
@@ -560,7 +599,13 @@ class FUCKsqlite:
             raise ValueError(f"Invalid table name: {table_name}")
 
         return await self.exists(
-            table_name = "sqlite_master",
-            where = "type='table' AND name = ?",
-            params = table_name,
+            table_name="sqlite_master",
+            where="type='table' AND name = ?",
+            params=table_name,
         )
+
+    async def list_tables(self) -> list[str]:
+        rows = await self.fetch(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        return [row["name"] for row in rows]
