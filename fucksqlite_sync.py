@@ -24,6 +24,68 @@ def _escape_identifier(name: str) -> str:
     return name.replace('"', '""')
 
 
+def _parse_order_by(
+        order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | list[str] | None,
+) -> str:
+    """order_by 인자를 안전하게 파싱하여 SQL ORDER BY 절 문자열을 반환합니다.
+    임의의 문자열 주입(SQL Injection)을 방지하기 위해 각 컬럼명의 식별자 유효성을 검증하고 이스케이프합니다.
+    """
+    if not order_by:
+        return ""
+
+    clauses: list[str] = []
+
+    def _parse_single(column: str, direction: str | None = None) -> str:
+        col = column.strip().strip('"')
+        if not col.isidentifier():
+            raise ValueError(f"Invalid column name in ORDER BY: '{column}'")
+        esc_col = _escape_identifier(col)
+        if direction is not None:
+            dir_upper = direction.strip().upper()
+            if dir_upper not in ("ASC", "DESC"):
+                raise ValueError(f"Direction must be 'ASC' or 'DESC', got '{direction}'")
+            return f'"{esc_col}" {dir_upper}'
+        return f'"{esc_col}" ASC'
+
+    if isinstance(order_by, tuple):
+        if len(order_by) == 2 and isinstance(order_by[0], str) and isinstance(order_by[1], str):
+            clauses.append(_parse_single(order_by[0], order_by[1]))
+        else:
+            raise ValueError("Each order item tuple must be (column_name, 'ASC'|'DESC').")
+    elif isinstance(order_by, str):
+        items = [s.strip() for s in order_by.split(",") if s.strip()]
+        if not items:
+            raise ValueError("ORDER BY string cannot be empty.")
+        for item in items:
+            parts = item.split()
+            if len(parts) == 1:
+                clauses.append(_parse_single(parts[0]))
+            elif len(parts) == 2:
+                clauses.append(_parse_single(parts[0], parts[1]))
+            else:
+                raise ValueError(f"Invalid ORDER BY clause segment: '{item}'")
+    elif isinstance(order_by, list):
+        if not order_by:
+            return ""
+        for item in order_by:
+            if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) and isinstance(item[1], str):
+                clauses.append(_parse_single(item[0], item[1]))
+            elif isinstance(item, str):
+                parts = item.split()
+                if len(parts) == 1:
+                    clauses.append(_parse_single(parts[0]))
+                elif len(parts) == 2:
+                    clauses.append(_parse_single(parts[0], parts[1]))
+                else:
+                    raise ValueError(f"Invalid ORDER BY item: '{item}'")
+            else:
+                raise TypeError("List items in ORDER BY must be (col, 'ASC'|'DESC') tuple or string.")
+    else:
+        raise TypeError("Order_by must be a str, tuple[str, str], or list.")
+
+    return f"ORDER BY {', '.join(clauses)}"
+
+
 @dataclass(frozen=True)
 class ForeignKey:
     target_table: str
@@ -123,6 +185,7 @@ class FUCKsqlite:
         self.autocommit = autocommit
         self.conn: sqlite3.Connection | None = None
         self._in_transaction = False
+        self._savepoint_count = 0
 
     def _get_connection(self) -> sqlite3.Connection:
         """연결 상태를 검증하고 sqlite3.Connection 인스턴스를 반환합니다."""
@@ -157,6 +220,7 @@ class FUCKsqlite:
             self.conn.close()
             self.conn = None
             self._in_transaction = False
+            self._savepoint_count = 0
 
     def __enter__(self) -> FUCKsqlite:
         self.connect()
@@ -167,18 +231,32 @@ class FUCKsqlite:
 
     @contextmanager
     def transaction(self):
-        """에러 발생 시 ROLLBACK, 정상 완료 시 COMMIT을 보장하는 트랜잭션 컨텍스트 매니저."""
+        """에러 발생 시 ROLLBACK, 정상 완료 시 COMMIT을 보장하는 트랜잭션 컨텍스트 매니저.
+        중첩 호출 시 SAVEPOINT를 활용하여 중첩 트랜잭션을 안전하게 지원합니다.
+        """
         conn = self._get_connection()
-        prev_in_tx = self._in_transaction
-        self._in_transaction = True
-        try:
-            yield self
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self._in_transaction = prev_in_tx
+        if self._in_transaction:
+            # 중첩 트랜잭션: SAVEPOINT 활용
+            self._savepoint_count += 1
+            sp_name = f"sp_{self._savepoint_count}"
+            conn.execute(f'SAVEPOINT "{sp_name}"')
+            try:
+                yield self
+                conn.execute(f'RELEASE SAVEPOINT "{sp_name}"')
+            except Exception:
+                conn.execute(f'ROLLBACK TO SAVEPOINT "{sp_name}"')
+                raise
+        else:
+            # 최상위 트랜잭션
+            self._in_transaction = True
+            try:
+                yield self
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                self._in_transaction = False
 
     def _auto_commit_if_needed(self) -> None:
         if self.autocommit and not self._in_transaction:
@@ -312,7 +390,7 @@ class FUCKsqlite:
             columns: list[str] | None = None,
             where: str | None = None,
             params: Sequence[Any] | Any | None = None,
-            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | None = None,
+            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | list[str] | None = None,
             limit: int | None = None,
             offset: int | None = None,
     ) -> list[dict[str, Any]]:
@@ -326,29 +404,9 @@ class FUCKsqlite:
         if where_clause:
             sql_cmd.append(where_clause)
 
-        if order_by:
-            if isinstance(order_by, tuple) and len(order_by) == 2 and isinstance(order_by[0], str):
-                order_list = [order_by]
-            elif isinstance(order_by, list):
-                order_list = order_by
-            elif isinstance(order_by, str):
-                sql_cmd.append(f"ORDER BY {order_by}")
-                order_list = None
-            else:
-                raise TypeError("Order_by must be a tuple[str, str], list[tuple[str, str]], or str.")
-
-            if order_list is not None:
-                order_clauses = []
-                for i in order_list:
-                    if not (isinstance(i, tuple) and len(i) == 2):
-                        raise ValueError("Each order item must be a tuple of (column_name, 'ASC'|'DESC').")
-                    column, direction = i
-                    direction_upper = direction.upper()
-                    if direction_upper not in ("ASC", "DESC"):
-                        raise ValueError(f"Direction must be 'ASC' or 'DESC', got '{direction}'")
-                    esc_col = _escape_identifier(column)
-                    order_clauses.append(f'"{esc_col}" {direction_upper}')
-                sql_cmd.append(f"ORDER BY {', '.join(order_clauses)}")
+        order_clause = _parse_order_by(order_by)
+        if order_clause:
+            sql_cmd.append(order_clause)
 
         if limit is not None:
             if not isinstance(limit, int) or limit < 0:
@@ -372,7 +430,7 @@ class FUCKsqlite:
             columns: list[str] | None = None,
             where: str | None = None,
             params: Sequence[Any] | Any | None = None,
-            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | None = None,
+            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | list[str] | None = None,
     ) -> dict[str, Any] | None:
         results = self.select(
             table_name=table_name,
@@ -486,8 +544,14 @@ class FUCKsqlite:
             sql_cmd: str,
             params: Sequence[Any] | Any | None = None,
     ) -> dict[str, Any] | None:
-        result = self.fetch(sql_cmd, params)
-        return result[0] if result else None
+        if not isinstance(sql_cmd, str):
+            raise TypeError(f"sql_cmd must be a string, got {type(sql_cmd).__name__}")
+
+        conn = self._get_connection()
+        val_list = self._normalize_params(params)
+        cur = conn.execute(sql_cmd, val_list)
+        row = cur.fetchone()
+        return dict(row) if row is not None else None
 
     def count(
             self,
