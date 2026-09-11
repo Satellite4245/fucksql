@@ -15,6 +15,8 @@ SQL_DEFAULT_KEYWORDS = frozenset({
     "FALSE",
 })
 
+ALLOWED_OR_ACTIONS = frozenset({"IGNORE", "REPLACE", "ABORT", "FAIL", "ROLLBACK"})
+ALLOWED_ON_ACTIONS = frozenset({"CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT", "NO ACTION"})
 ON_ACTION = Literal["CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT", "NO ACTION"]
 ORDER_DIR = Literal["ASC", "DESC"]
 OR_ACTION = Literal["IGNORE", "REPLACE", "ABORT", "FAIL", "ROLLBACK"]
@@ -93,6 +95,24 @@ class ForeignKey:
     on_delete: ON_ACTION | None = None
     on_update: ON_ACTION | None = None
 
+    def __post_init__(self):
+        if not isinstance(self.target_table, str) or not self.target_table.isidentifier():
+            raise ValueError(f"Invalid target table name: '{self.target_table}'")
+        if not isinstance(self.target_column, str) or not self.target_column.isidentifier():
+            raise ValueError(f"Invalid target column name: '{self.target_column}'")
+
+        if self.on_delete is not None:
+            del_upper = self.on_delete.upper()
+            if del_upper not in ALLOWED_ON_ACTIONS:
+                raise ValueError(f"Invalid on_delete action '{self.on_delete}'. Allowed: {', '.join(sorted(ALLOWED_ON_ACTIONS))}")
+            object.__setattr__(self, "on_delete", del_upper)
+
+        if self.on_update is not None:
+            upd_upper = self.on_update.upper()
+            if upd_upper not in ALLOWED_ON_ACTIONS:
+                raise ValueError(f"Invalid on_update action '{self.on_update}'. Allowed: {', '.join(sorted(ALLOWED_ON_ACTIONS))}")
+            object.__setattr__(self, "on_update", upd_upper)
+
     def to_sql(self) -> str:
         esc_tbl = _escape_identifier(self.target_table)
         esc_col = _escape_identifier(self.target_column)
@@ -118,7 +138,10 @@ def _format_default_value(val: Any) -> str:
         return f"'{escaped}'"
     if isinstance(val, bytes):
         return f"X'{val.hex().upper()}'"
-    return f"({str(val)})"
+    raise TypeError(
+        f"Unsupported default value type: {type(val).__name__}. "
+        f"Allowed: None, bool, int, float, str, bytes."
+    )
 
 
 @dataclass(frozen=True)
@@ -136,6 +159,8 @@ class Column:
     def __post_init__(self):
         if not isinstance(self.name, str):
             raise TypeError(f"Column name must be a string, got {type(self.name).__name__}.")
+        if not self.name.isidentifier():
+            raise ValueError(f"Invalid column name: '{self.name}'")
         if not isinstance(self.data_type, str):
             raise TypeError(f"Data type must be a string, got {type(self.data_type).__name__}.")
 
@@ -151,7 +176,7 @@ class Column:
 
     def to_sql(self) -> str:
         esc_name = _escape_identifier(self.name)
-        sql_cmd = [f'\"{esc_name}\"', self.data_type]
+        sql_cmd = [f'"{esc_name}"', self.data_type]
         if self.primary_key:
             sql_cmd.append("PRIMARY KEY")
             if self.autoincrement:
@@ -179,6 +204,9 @@ class FUCKsqlite:
             busy_timeout_ms: int = 5000,
             autocommit: bool = True,
     ):
+        if not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 0:
+            raise TypeError(f"busy_timeout_ms must be a non-negative integer, got {busy_timeout_ms!r}")
+
         self.db_name = db_name
         self.use_foreign_key = use_foreign_key
         self.busy_timeout_ms = busy_timeout_ms
@@ -344,6 +372,10 @@ class FUCKsqlite:
         if not data:
             raise ValueError("Data dictionary cannot be empty.")
 
+        if or_action is not None:
+            if not isinstance(or_action, str) or or_action.upper() not in ALLOWED_OR_ACTIONS:
+                raise ValueError(f"Invalid or_action '{or_action}'. Allowed: {', '.join(sorted(ALLOWED_OR_ACTIONS))}")
+
         conn = self._get_connection()
         columns = list(data.keys())
         values = list(data.values())
@@ -351,7 +383,7 @@ class FUCKsqlite:
         cols_str = ", ".join(f'"{_escape_identifier(col)}"' for col in columns)
         placeholders = ", ".join("?" for _ in columns)
 
-        or_cmd = f"OR {or_action} " if or_action else ""
+        or_cmd = f"OR {or_action.upper()} " if or_action else ""
         esc_tbl = _escape_identifier(table_name)
         sql_cmd = f'INSERT {or_cmd}INTO "{esc_tbl}" ({cols_str}) VALUES ({placeholders})'
 
@@ -395,6 +427,11 @@ class FUCKsqlite:
             offset: int | None = None,
     ) -> list[dict[str, Any]]:
         conn = self._get_connection()
+
+        if not isinstance(table_name, str):
+            raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
+        if not table_name.isidentifier():
+            raise ValueError(f"Invalid table name: {table_name}")
 
         esc_tbl = _escape_identifier(table_name)
         cols = ", ".join(f'"{_escape_identifier(col)}"' for col in columns) if columns else "*"
@@ -457,8 +494,12 @@ class FUCKsqlite:
             raise ValueError(f"Invalid table name: {table_name}")
         if not data:
             raise ValueError("Data dictionary cannot be empty.")
-        if not where and not allow_all:
+        if not (where and where.strip()) and not allow_all:
             raise ValueError("Where is required to update the table. Or enable allow_all=True.")
+
+        if or_action is not None:
+            if not isinstance(or_action, str) or or_action.upper() not in ALLOWED_OR_ACTIONS:
+                raise ValueError(f"Invalid or_action '{or_action}'. Allowed: {', '.join(sorted(ALLOWED_OR_ACTIONS))}")
 
         conn = self._get_connection()
 
@@ -469,7 +510,7 @@ class FUCKsqlite:
             cols.append(f'"{esc_col}" = ?')
             values.append(val)
 
-        or_cmd = f"OR {or_action} " if or_action else ""
+        or_cmd = f"OR {or_action.upper()} " if or_action else ""
         esc_tbl = _escape_identifier(table_name)
         sql_cmd = [f'UPDATE {or_cmd}"{esc_tbl}" SET {", ".join(cols)}']
 
@@ -494,7 +535,7 @@ class FUCKsqlite:
             raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
         if not table_name.isidentifier():
             raise ValueError(f"Invalid table name: {table_name}")
-        if not where and not allow_all:
+        if not (where and where.strip()) and not allow_all:
             raise ValueError("Where is required to delete the table. Or enable allow_all=True.")
 
         conn = self._get_connection()
