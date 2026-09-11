@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import math
+import re
+import threading
+from collections.abc import Iterable
 from typing import Any, Literal, Sequence, cast
 from dataclasses import dataclass
 from contextlib import contextmanager
@@ -27,10 +31,11 @@ def _escape_identifier(name: str) -> str:
 
 
 def _parse_order_by(
-        order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | list[str] | None,
+        order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | list[str] | Sequence[Any] | None,
 ) -> str:
     """order_by 인자를 안전하게 파싱하여 SQL ORDER BY 절 문자열을 반환합니다.
     임의의 문자열 주입(SQL Injection)을 방지하기 위해 각 컬럼명의 식별자 유효성을 검증하고 이스케이프합니다.
+    단일 튜플, 튜플의 튜플, 리스트, 문자열 등 다양한 형식을 지원합니다.
     """
     if not order_by:
         return ""
@@ -49,11 +54,24 @@ def _parse_order_by(
             return f'"{esc_col}" {dir_upper}'
         return f'"{esc_col}" ASC'
 
-    if isinstance(order_by, tuple):
-        if len(order_by) == 2 and isinstance(order_by[0], str) and isinstance(order_by[1], str):
-            clauses.append(_parse_single(order_by[0], order_by[1]))
-        else:
-            raise ValueError("Each order item tuple must be (column_name, 'ASC'|'DESC').")
+    if isinstance(order_by, tuple) and len(order_by) == 2 and isinstance(order_by[0], str) and isinstance(order_by[1], str) and order_by[1].strip().upper() in ("ASC", "DESC"):
+        clauses.append(_parse_single(order_by[0], order_by[1]))
+    elif isinstance(order_by, (list, tuple)):
+        if not order_by:
+            return ""
+        for item in order_by:
+            if isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[0], str) and isinstance(item[1], str):
+                clauses.append(_parse_single(item[0], item[1]))
+            elif isinstance(item, str):
+                parts = item.split()
+                if len(parts) == 1:
+                    clauses.append(_parse_single(parts[0]))
+                elif len(parts) == 2:
+                    clauses.append(_parse_single(parts[0], parts[1]))
+                else:
+                    raise ValueError(f"Invalid ORDER BY item: '{item}'")
+            else:
+                raise TypeError("Items in ORDER BY must be (col, 'ASC'|'DESC') or string.")
     elif isinstance(order_by, str):
         items = [s.strip() for s in order_by.split(",") if s.strip()]
         if not items:
@@ -66,24 +84,8 @@ def _parse_order_by(
                 clauses.append(_parse_single(parts[0], parts[1]))
             else:
                 raise ValueError(f"Invalid ORDER BY clause segment: '{item}'")
-    elif isinstance(order_by, list):
-        if not order_by:
-            return ""
-        for item in order_by:
-            if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) and isinstance(item[1], str):
-                clauses.append(_parse_single(item[0], item[1]))
-            elif isinstance(item, str):
-                parts = item.split()
-                if len(parts) == 1:
-                    clauses.append(_parse_single(parts[0]))
-                elif len(parts) == 2:
-                    clauses.append(_parse_single(parts[0], parts[1]))
-                else:
-                    raise ValueError(f"Invalid ORDER BY item: '{item}'")
-            else:
-                raise TypeError("List items in ORDER BY must be (col, 'ASC'|'DESC') tuple or string.")
     else:
-        raise TypeError("Order_by must be a str, tuple[str, str], or list.")
+        raise TypeError("Order_by must be a str, tuple[str, str], list, or sequence of order clauses.")
 
     return f"ORDER BY {', '.join(clauses)}"
 
@@ -129,7 +131,11 @@ def _format_default_value(val: Any) -> str:
         return "NULL"
     if isinstance(val, bool):
         return "1" if val else "0"
-    if isinstance(val, (int, float)):
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            raise ValueError(f"Float default value must be finite (not inf, -inf, or nan), got {val}")
         return str(val)
     if isinstance(val, str):
         if val.upper() in SQL_DEFAULT_KEYWORDS:
@@ -204,7 +210,7 @@ class FUCKsqlite:
             busy_timeout_ms: int = 5000,
             autocommit: bool = True,
     ):
-        if not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 0:
+        if isinstance(busy_timeout_ms, bool) or not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 0:
             raise TypeError(f"busy_timeout_ms must be a non-negative integer, got {busy_timeout_ms!r}")
 
         self.db_name = db_name
@@ -214,6 +220,7 @@ class FUCKsqlite:
         self.conn: sqlite3.Connection | None = None
         self._in_transaction = False
         self._savepoint_count = 0
+        self._lock = threading.RLock()
 
     def _get_connection(self) -> sqlite3.Connection:
         """연결 상태를 검증하고 sqlite3.Connection 인스턴스를 반환합니다."""
@@ -222,7 +229,13 @@ class FUCKsqlite:
         return self.conn
 
     def connect(self) -> None:
-        self.conn = sqlite3.connect(self.db_name, timeout=self.busy_timeout_ms / 1000.0)
+        if self.conn is not None:
+            return
+        self.conn = sqlite3.connect(
+            self.db_name,
+            timeout=self.busy_timeout_ms / 1000.0,
+            check_same_thread=False,
+        )
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
@@ -231,24 +244,27 @@ class FUCKsqlite:
         self.conn.commit()
 
     def commit(self) -> None:
-        conn = self._get_connection()
-        conn.commit()
+        with self._lock:
+            conn = self._get_connection()
+            conn.commit()
 
     def rollback(self) -> None:
-        conn = self._get_connection()
-        conn.rollback()
+        with self._lock:
+            conn = self._get_connection()
+            conn.rollback()
 
     def close(self) -> None:
-        if self.conn is not None:
-            if not self._in_transaction:
-                try:
-                    self.conn.commit()
-                except Exception:
-                    pass
-            self.conn.close()
-            self.conn = None
-            self._in_transaction = False
-            self._savepoint_count = 0
+        with self._lock:
+            if self.conn is not None:
+                if not self._in_transaction:
+                    try:
+                        self.conn.commit()
+                    except Exception:
+                        pass
+                self.conn.close()
+                self.conn = None
+                self._in_transaction = False
+                self._savepoint_count = 0
 
     def __enter__(self) -> FUCKsqlite:
         self.connect()
@@ -259,54 +275,61 @@ class FUCKsqlite:
 
     @contextmanager
     def transaction(self):
-        """에러 발생 시 ROLLBACK, 정상 완료 시 COMMIT을 보장하는 트랜잭션 컨텍스트 매니저.
+        """에러 발생 또는 스레드 중단 시 ROLLBACK, 정상 완료 시 COMMIT을 보장하는 트랜잭션 컨텍스트 매니저.
+        스레드 재진입 락(threading.RLock)으로 스레드 간 동시성 보호 및 데드락 없는 중첩 트랜잭션을 보장하며,
         중첩 호출 시 SAVEPOINT를 활용하여 중첩 트랜잭션을 안전하게 지원합니다.
         """
-        conn = self._get_connection()
-        if self._in_transaction:
-            # 중첩 트랜잭션: SAVEPOINT 활용
-            self._savepoint_count += 1
-            sp_name = f"sp_{self._savepoint_count}"
-            conn.execute(f'SAVEPOINT "{sp_name}"')
-            try:
-                yield self
-                conn.execute(f'RELEASE SAVEPOINT "{sp_name}"')
-            except Exception:
-                conn.execute(f'ROLLBACK TO SAVEPOINT "{sp_name}"')
-                raise
-        else:
-            # 최상위 트랜잭션
-            self._in_transaction = True
-            try:
-                yield self
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                self._in_transaction = False
+        with self._lock:
+            conn = self._get_connection()
+            if self._in_transaction:
+                # 중첩 트랜잭션: SAVEPOINT 활용
+                self._savepoint_count += 1
+                sp_name = f"sp_{self._savepoint_count}"
+                conn.execute(f'SAVEPOINT "{sp_name}"')
+                try:
+                    yield self
+                    conn.execute(f'RELEASE SAVEPOINT "{sp_name}"')
+                except BaseException:
+                    conn.execute(f'ROLLBACK TO SAVEPOINT "{sp_name}"')
+                    raise
+            else:
+                # 최상위 트랜잭션
+                self._in_transaction = True
+                try:
+                    yield self
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
+                finally:
+                    self._in_transaction = False
 
     def _auto_commit_if_needed(self) -> None:
         if self.autocommit and not self._in_transaction:
             conn = self._get_connection()
             conn.commit()
 
-    def _normalize_params(self, params: Sequence[Any] | Any | None) -> Sequence[Any]:
-        """params가 None, 단일 원소(int, str 등), 또는 Sequence(list, tuple)일 때 바인딩 가능한 Sequence로 정규화합니다."""
+    def _normalize_params(
+            self,
+            params: Sequence[Any] | dict[str, Any] | Any | None,
+    ) -> Sequence[Any] | dict[str, Any]:
+        """params가 None, dict, 단일 원소(int, str 등), 또는 Sequence/Iterable일 때 바인딩 가능한 형식으로 정규화합니다."""
         if params is None:
             return ()
-        if isinstance(params, (list, tuple)):
+        if isinstance(params, (list, tuple, dict)):
             return params
-        if isinstance(params, set):
-            return list(params)
+        if isinstance(params, (str, bytes)):
+            return (params,)
+        if isinstance(params, Iterable):
+            return tuple(params)
         return (params,)
 
     def _build_where_clause(
             self,
             where: str | None,
-            params: Sequence[Any] | Any | None = None,
-    ) -> tuple[str, Sequence[Any]]:
-        """where Raw SQL 문자열과 파라미터를 파싱하여 WHERE SQL 절과 바인딩할 파라미터 시퀀스를 반환합니다."""
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
+    ) -> tuple[str, Sequence[Any] | dict[str, Any]]:
+        """where Raw SQL 문자열과 파라미터를 파싱하여 WHERE SQL 절과 바인딩할 파라미터 시퀀스/딕셔너리를 반환합니다."""
         if not where:
             return "", ()
 
@@ -317,7 +340,7 @@ class FUCKsqlite:
         if not where_str:
             return "", ()
 
-        clause = where_str if where_str.upper().startswith("WHERE ") else f"WHERE {where_str}"
+        clause = where_str if re.match(r"^where\s+", where_str, re.IGNORECASE) else f"WHERE {where_str}"
         val_list = self._normalize_params(params)
         return clause, val_list
 
@@ -336,14 +359,15 @@ class FUCKsqlite:
         if not all(isinstance(column, Column) for column in columns):
             raise TypeError("All items in columns must be of type Column.")
 
-        conn = self._get_connection()
-        if_not_exists_cmd = "IF NOT EXISTS " if if_not_exists else ""
-        cols_def = ", ".join(col.to_sql() for col in columns)
+        with self._lock:
+            conn = self._get_connection()
+            if_not_exists_cmd = "IF NOT EXISTS " if if_not_exists else ""
+            cols_def = ", ".join(col.to_sql() for col in columns)
 
-        esc_tbl = _escape_identifier(table_name)
-        sql_cmd = f'CREATE TABLE {if_not_exists_cmd}"{esc_tbl}" ({cols_def})'
-        conn.execute(sql_cmd)
-        self._auto_commit_if_needed()
+            esc_tbl = _escape_identifier(table_name)
+            sql_cmd = f'CREATE TABLE {if_not_exists_cmd}"{esc_tbl}" ({cols_def})'
+            conn.execute(sql_cmd)
+            self._auto_commit_if_needed()
 
     def drop_table(self, table_name: str, if_exists: bool = True) -> None:
         if not isinstance(table_name, str):
@@ -351,13 +375,14 @@ class FUCKsqlite:
         if not table_name.isidentifier():
             raise ValueError(f"Invalid table name: {table_name}")
 
-        conn = self._get_connection()
-        if_exists_cmd = "IF EXISTS " if if_exists else ""
-        esc_tbl = _escape_identifier(table_name)
-        sql_cmd = f'DROP TABLE {if_exists_cmd}"{esc_tbl}"'
+        with self._lock:
+            conn = self._get_connection()
+            if_exists_cmd = "IF EXISTS " if if_exists else ""
+            esc_tbl = _escape_identifier(table_name)
+            sql_cmd = f'DROP TABLE {if_exists_cmd}"{esc_tbl}"'
 
-        conn.execute(sql_cmd)
-        self._auto_commit_if_needed()
+            conn.execute(sql_cmd)
+            self._auto_commit_if_needed()
 
     def insert(
             self,
@@ -372,24 +397,29 @@ class FUCKsqlite:
         if not data:
             raise ValueError("Data dictionary cannot be empty.")
 
+        for col in data.keys():
+            if not isinstance(col, str) or not col.isidentifier():
+                raise ValueError(f"Invalid column name: '{col}'")
+
         if or_action is not None:
             if not isinstance(or_action, str) or or_action.upper() not in ALLOWED_OR_ACTIONS:
                 raise ValueError(f"Invalid or_action '{or_action}'. Allowed: {', '.join(sorted(ALLOWED_OR_ACTIONS))}")
 
-        conn = self._get_connection()
-        columns = list(data.keys())
-        values = list(data.values())
+        with self._lock:
+            conn = self._get_connection()
+            columns = list(data.keys())
+            values = list(data.values())
 
-        cols_str = ", ".join(f'"{_escape_identifier(col)}"' for col in columns)
-        placeholders = ", ".join("?" for _ in columns)
+            cols_str = ", ".join(f'"{_escape_identifier(col)}"' for col in columns)
+            placeholders = ", ".join("?" for _ in columns)
 
-        or_cmd = f"OR {or_action.upper()} " if or_action else ""
-        esc_tbl = _escape_identifier(table_name)
-        sql_cmd = f'INSERT {or_cmd}INTO "{esc_tbl}" ({cols_str}) VALUES ({placeholders})'
+            or_cmd = f"OR {or_action.upper()} " if or_action else ""
+            esc_tbl = _escape_identifier(table_name)
+            sql_cmd = f'INSERT {or_cmd}INTO "{esc_tbl}" ({cols_str}) VALUES ({placeholders})'
 
-        cur = conn.execute(sql_cmd, values)
-        self._auto_commit_if_needed()
-        return cur.lastrowid
+            cur = conn.execute(sql_cmd, values)
+            self._auto_commit_if_needed()
+            return cur.lastrowid
 
     def inserts(self, table_name: str, data_list: list[dict[str, Any]]) -> int:
         if not isinstance(table_name, str):
@@ -401,37 +431,55 @@ class FUCKsqlite:
         if not data_list:
             return 0
 
-        conn = self._get_connection()
+        for row in data_list:
+            if not isinstance(row, dict):
+                raise TypeError(f"All items in data_list must be dicts, got {type(row).__name__}")
+            if not row:
+                raise ValueError("Row dictionary in data_list cannot be empty.")
+            for col in row.keys():
+                if not isinstance(col, str) or not col.isidentifier():
+                    raise ValueError(f"Invalid column name: '{col}'")
 
-        # O(N) 순서 보존 컬럼 추출
-        columns = list(dict.fromkeys(k for row in data_list for k in row))
-        cols_str = ", ".join(f'"{_escape_identifier(col)}"' for col in columns)
-        placeholders = ", ".join("?" for _ in columns)
+        with self._lock:
+            conn = self._get_connection()
 
-        values = [tuple(row.get(col) for col in columns) for row in data_list]
+            # O(N) 순서 보존 컬럼 추출
+            columns = list(dict.fromkeys(k for row in data_list for k in row))
+            if not columns:
+                raise ValueError("No valid columns found in data_list.")
 
-        esc_tbl = _escape_identifier(table_name)
-        sql_cmd = f'INSERT INTO "{esc_tbl}" ({cols_str}) VALUES ({placeholders})'
-        cur = conn.executemany(sql_cmd, values)
-        self._auto_commit_if_needed()
-        return cur.rowcount
+            cols_str = ", ".join(f'"{_escape_identifier(col)}"' for col in columns)
+            placeholders = ", ".join("?" for _ in columns)
+
+            values = [tuple(row.get(col) for col in columns) for row in data_list]
+
+            esc_tbl = _escape_identifier(table_name)
+            sql_cmd = f'INSERT INTO "{esc_tbl}" ({cols_str}) VALUES ({placeholders})'
+            cur = conn.executemany(sql_cmd, values)
+            self._auto_commit_if_needed()
+            return cur.rowcount
 
     def select(
             self,
             table_name: str,
-            columns: list[str] | None = None,
+            columns: list[str] | tuple[str, ...] | None = None,
             where: str | None = None,
-            params: Sequence[Any] | Any | None = None,
-            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | list[str] | None = None,
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
+            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | list[str] | Sequence[Any] | None = None,
             limit: int | None = None,
             offset: int | None = None,
     ) -> list[dict[str, Any]]:
-        conn = self._get_connection()
-
         if not isinstance(table_name, str):
             raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
         if not table_name.isidentifier():
             raise ValueError(f"Invalid table name: {table_name}")
+
+        if columns is not None:
+            if not isinstance(columns, (list, tuple)):
+                raise TypeError(f"columns must be a list or tuple of strings, got {type(columns).__name__}")
+            for col in columns:
+                if not isinstance(col, str) or not col.isidentifier():
+                    raise ValueError(f"Invalid column name: '{col}'")
 
         esc_tbl = _escape_identifier(table_name)
         cols = ", ".join(f'"{_escape_identifier(col)}"' for col in columns) if columns else "*"
@@ -446,28 +494,34 @@ class FUCKsqlite:
             sql_cmd.append(order_clause)
 
         if limit is not None:
-            if not isinstance(limit, int) or limit < 0:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
                 raise ValueError("Limit must be a non-negative integer.")
             sql_cmd.append(f"LIMIT {limit}")
 
             if offset is not None:
-                if not isinstance(offset, int) or offset < 0:
+                if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
                     raise ValueError("Offset must be a non-negative integer.")
                 sql_cmd.append(f"OFFSET {offset}")
+        elif offset is not None:
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise ValueError("Offset must be a non-negative integer.")
+            sql_cmd.append(f"LIMIT -1 OFFSET {offset}")
 
         full_sql = " ".join(sql_cmd)
 
-        cur = conn.execute(full_sql, values)
-        rows = cur.fetchall()
-        return cast(list[dict[str, Any]], [dict(row) for row in rows])
+        with self._lock:
+            conn = self._get_connection()
+            cur = conn.execute(full_sql, values)
+            rows = cur.fetchall()
+            return cast(list[dict[str, Any]], [dict(row) for row in rows])
 
     def select_one(
             self,
             table_name: str,
-            columns: list[str] | None = None,
+            columns: list[str] | tuple[str, ...] | None = None,
             where: str | None = None,
-            params: Sequence[Any] | Any | None = None,
-            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | list[str] | None = None,
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
+            order_by: str | tuple[str, ORDER_DIR] | list[tuple[str, ORDER_DIR]] | list[str] | Sequence[Any] | None = None,
     ) -> dict[str, Any] | None:
         results = self.select(
             table_name=table_name,
@@ -484,7 +538,7 @@ class FUCKsqlite:
             table_name: str,
             data: dict[str, Any],
             where: str | None = None,
-            params: Sequence[Any] | Any | None = None,
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
             or_action: OR_ACTION | None = None,
             allow_all: bool = False,
     ) -> int:
@@ -494,14 +548,17 @@ class FUCKsqlite:
             raise ValueError(f"Invalid table name: {table_name}")
         if not data:
             raise ValueError("Data dictionary cannot be empty.")
+
+        for col in data.keys():
+            if not isinstance(col, str) or not col.isidentifier():
+                raise ValueError(f"Invalid column name: '{col}'")
+
         if not (where and where.strip()) and not allow_all:
             raise ValueError("Where is required to update the table. Or enable allow_all=True.")
 
         if or_action is not None:
             if not isinstance(or_action, str) or or_action.upper() not in ALLOWED_OR_ACTIONS:
                 raise ValueError(f"Invalid or_action '{or_action}'. Allowed: {', '.join(sorted(ALLOWED_OR_ACTIONS))}")
-
-        conn = self._get_connection()
 
         cols = []
         values = []
@@ -517,18 +574,23 @@ class FUCKsqlite:
         where_clause, where_values = self._build_where_clause(where, params)
         if where_clause:
             sql_cmd.append(where_clause)
+            if isinstance(where_values, dict):
+                raise TypeError("Named dict parameters are not supported together with qmark positional update values.")
             values.extend(where_values)
 
         full_sql = " ".join(sql_cmd)
-        cur = conn.execute(full_sql, values)
-        self._auto_commit_if_needed()
-        return cur.rowcount
+
+        with self._lock:
+            conn = self._get_connection()
+            cur = conn.execute(full_sql, values)
+            self._auto_commit_if_needed()
+            return cur.rowcount
 
     def delete(
             self,
             table_name: str,
             where: str | None = None,
-            params: Sequence[Any] | Any | None = None,
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
             allow_all: bool = False,
     ) -> int:
         if not isinstance(table_name, str):
@@ -538,8 +600,6 @@ class FUCKsqlite:
         if not (where and where.strip()) and not allow_all:
             raise ValueError("Where is required to delete the table. Or enable allow_all=True.")
 
-        conn = self._get_connection()
-
         sql_cmd = [f'DELETE FROM "{_escape_identifier(table_name)}"']
 
         where_clause, where_values = self._build_where_clause(where, params)
@@ -548,51 +608,56 @@ class FUCKsqlite:
 
         full_sql = " ".join(sql_cmd)
 
-        cur = conn.execute(full_sql, where_values)
-        self._auto_commit_if_needed()
-        return cur.rowcount
+        with self._lock:
+            conn = self._get_connection()
+            cur = conn.execute(full_sql, where_values)
+            self._auto_commit_if_needed()
+            return cur.rowcount
 
     def execute(
             self,
             sql_cmd: str,
-            params: Sequence[Any] | Any | None = None,
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
     ) -> sqlite3.Cursor:
         if not isinstance(sql_cmd, str):
             raise TypeError(f"sql_cmd must be a string, got {type(sql_cmd).__name__}")
 
-        conn = self._get_connection()
         val_list = self._normalize_params(params)
-        cur = conn.execute(sql_cmd, val_list)
-        self._auto_commit_if_needed()
-        return cur
+        with self._lock:
+            conn = self._get_connection()
+            cur = conn.execute(sql_cmd, val_list)
+            self._auto_commit_if_needed()
+            return cur
 
     def fetch(
             self,
             sql_cmd: str,
-            params: Sequence[Any] | Any | None = None,
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
     ) -> list[dict[str, Any]]:
         if not isinstance(sql_cmd, str):
             raise TypeError(f"sql_cmd must be a string, got {type(sql_cmd).__name__}")
 
-        conn = self._get_connection()
         val_list = self._normalize_params(params)
-        cur = conn.execute(sql_cmd, val_list)
-        rows = cur.fetchall()
-        return cast(list[dict[str, Any]], [dict(row) for row in rows])
+        with self._lock:
+            conn = self._get_connection()
+            cur = conn.execute(sql_cmd, val_list)
+            rows = cur.fetchall()
+            return cast(list[dict[str, Any]], [dict(row) for row in rows])
 
     def fetch_one(
             self,
             sql_cmd: str,
-            params: Sequence[Any] | Any | None = None,
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
     ) -> dict[str, Any] | None:
         if not isinstance(sql_cmd, str):
             raise TypeError(f"sql_cmd must be a string, got {type(sql_cmd).__name__}")
 
-        conn = self._get_connection()
         val_list = self._normalize_params(params)
-        cur = conn.execute(sql_cmd, val_list)
-        row = cur.fetchone()
-        return dict(row) if row is not None else None
+        with self._lock:
+            conn = self._get_connection()
+            cur = conn.execute(sql_cmd, val_list)
+            row = cur.fetchone()
+            return dict(row) if row is not None else None
 
     def count(
             self,
@@ -600,7 +665,7 @@ class FUCKsqlite:
             columns: str | None = None,
             distinct: bool = False,
             where: str | None = None,
-            params: Sequence[Any] | Any | None = None,
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
     ) -> int:
         if not isinstance(table_name, str):
             raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
@@ -611,9 +676,9 @@ class FUCKsqlite:
         if columns is not None and not isinstance(columns, str):
             raise TypeError(f"columns must be a string or None, got {type(columns).__name__}")
 
-        conn = self._get_connection()
-
         if columns:
+            if not columns.isidentifier():
+                raise ValueError(f"Invalid column name: {columns}")
             col_target = f'COUNT({"DISTINCT " if distinct else ""}"{_escape_identifier(columns)}")'
         else:
             col_target = "COUNT(*)"
@@ -626,22 +691,22 @@ class FUCKsqlite:
 
         full_sql = " ".join(sql_cmd)
 
-        cur = conn.execute(full_sql, where_values)
-        row = cur.fetchone()
-        return row["cnt"] if row else 0
+        with self._lock:
+            conn = self._get_connection()
+            cur = conn.execute(full_sql, where_values)
+            row = cur.fetchone()
+            return row["cnt"] if row else 0
 
     def exists(
             self,
             table_name: str,
             where: str | None = None,
-            params: Sequence[Any] | Any | None = None,
+            params: Sequence[Any] | dict[str, Any] | Any | None = None,
     ) -> bool:
         if not isinstance(table_name, str):
             raise TypeError(f"Table name must be a string, got {type(table_name).__name__}")
         if not table_name.isidentifier():
             raise ValueError(f"Invalid table name: {table_name}")
-
-        conn = self._get_connection()
 
         sql_cmd = [f'SELECT 1 FROM "{_escape_identifier(table_name)}"']
         where_clause, where_values = self._build_where_clause(where, params)
@@ -650,15 +715,18 @@ class FUCKsqlite:
         sql_cmd.append("LIMIT 1")
 
         full_sql = " ".join(sql_cmd)
-        cur = conn.execute(full_sql, where_values)
-        row = cur.fetchone()
-        return row is not None
+
+        with self._lock:
+            conn = self._get_connection()
+            cur = conn.execute(full_sql, where_values)
+            row = cur.fetchone()
+            return row is not None
 
     def create_index(
             self,
             index_name: str,
             table_name: str,
-            columns: str | list[str],
+            columns: str | list[str] | tuple[str, ...],
             unique: bool = False,
             if_not_exists: bool = True,
     ) -> None:
@@ -667,11 +735,12 @@ class FUCKsqlite:
         if not isinstance(table_name, str) or not table_name.isidentifier():
             raise ValueError(f"Invalid table name: {table_name}")
 
-        conn = self._get_connection()
-
         col_list = [columns] if isinstance(columns, str) else list(columns)
         if not col_list:
             raise ValueError("At least one column must be provided for index")
+        for col in col_list:
+            if not isinstance(col, str) or not col.isidentifier():
+                raise ValueError(f"Invalid column name for index: '{col}'")
 
         unique_cmd = "UNIQUE " if unique else ""
         if_not_exists_cmd = "IF NOT EXISTS " if if_not_exists else ""
@@ -681,21 +750,25 @@ class FUCKsqlite:
         cols_str = ", ".join(f'"{_escape_identifier(c)}"' for c in col_list)
 
         sql_cmd = f'CREATE {unique_cmd}INDEX {if_not_exists_cmd}"{esc_idx}" ON "{esc_tbl}" ({cols_str})'
-        conn.execute(sql_cmd)
-        self._auto_commit_if_needed()
+
+        with self._lock:
+            conn = self._get_connection()
+            conn.execute(sql_cmd)
+            self._auto_commit_if_needed()
 
     def drop_index(self, index_name: str, if_exists: bool = True) -> None:
         if not isinstance(index_name, str) or not index_name.isidentifier():
             raise ValueError(f"Invalid index name: {index_name}")
 
-        conn = self._get_connection()
-
         if_exists_cmd = "IF EXISTS " if if_exists else ""
         esc_idx = _escape_identifier(index_name)
 
         sql_cmd = f'DROP INDEX {if_exists_cmd}"{esc_idx}"'
-        conn.execute(sql_cmd)
-        self._auto_commit_if_needed()
+
+        with self._lock:
+            conn = self._get_connection()
+            conn.execute(sql_cmd)
+            self._auto_commit_if_needed()
 
     def table_exists(self, table_name: str) -> bool:
         if not isinstance(table_name, str):
